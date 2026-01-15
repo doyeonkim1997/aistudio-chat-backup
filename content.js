@@ -4,8 +4,7 @@
 
   console.log("[AI Studio Chat Backup] content.js injected", location.href);
 
-  const TURN_SEL =
-    ".virtual-scroll-container.user-prompt-container, .virtual-scroll-container.model-prompt-container";
+  const TURN_SEL = ".chat-turn-container";
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -23,63 +22,120 @@
     return false;
   }
 
-  function parseTurnsNow() {
+  function getRoleFromTurn(turnEl) {
+    if (turnEl.classList.contains("user")) return "User";
+    if (turnEl.classList.contains("model")) return "Model";
+
+    const roleNode = turnEl.querySelector("[data-turn-role]");
+    const role = roleNode?.getAttribute("data-turn-role");
+    if (role === "User" || role === "Model") return role;
+
+    const author = turnEl.querySelector(".author-label")?.textContent?.trim();
+    if (author === "User" || author === "Model") return author;
+
+    return "Unknown";
+  }
+
+  function getTurnKey(turnEl, role, text) {
+    const chunkId = turnEl
+      .querySelector("ms-prompt-chunk[id]")
+      ?.getAttribute("id");
+    if (chunkId) return chunkId;
+    return `${role}|${text.replace(/\s+/g, " ").slice(0, 300)}`;
+  }
+
+  function parseTurnsInDomOrder() {
     const nodes = [...document.querySelectorAll(TURN_SEL)];
+
     return nodes
-      .map((node) => {
-        const role = node.classList.contains("user-prompt-container")
-          ? "User"
-          : "Model";
-        const parts = [...node.querySelectorAll(".very-large-text-container")]
+      .map((turnEl) => {
+        const role = getRoleFromTurn(turnEl);
+
+        const parts = [...turnEl.querySelectorAll(".very-large-text-container")]
           .map((el) => normalizeText(el.innerText))
           .filter((t) => !isNoise(t));
 
-        return { role, text: parts.join("\n\n") };
+        const text = parts.join("\n\n").trim();
+        if (!text) return null;
+
+        return { role, text, _key: getTurnKey(turnEl, role, text) };
       })
-      .filter((t) => t.text.length > 0);
+      .filter(Boolean);
   }
 
-  function addTurns(acc, turns) {
+  function addTurnsInOrder(acc, turns) {
     for (const t of turns) {
-      const key = `${t.role}|${t.text.replace(/\s+/g, " ").slice(0, 300)}`;
-      if (acc.seen.has(key)) continue;
-      acc.seen.add(key);
-      acc.list.push(t);
+      if (acc.seen.has(t._key)) continue;
+      acc.seen.add(t._key);
+      acc.list.push({ role: t.role, text: t.text });
     }
   }
 
-  async function collectAllByScrollingUp(scroller) {
-    const acc = { seen: new Set(), list: [] };
+  async function loadAllToTop(scroller) {
+    let noProgressRounds = 0;
 
-    addTurns(acc, parseTurnsNow());
-
-    let noNewRounds = 0;
-
-    for (let i = 0; i < 2500; i++) {
+    for (let i = 0; i < 3000; i++) {
       const beforeTop = scroller.scrollTop;
+      const beforeHeight = scroller.scrollHeight;
 
       const step = Math.max(250, Math.floor(scroller.clientHeight * 0.7));
       scroller.scrollTop = Math.max(0, beforeTop - step);
 
       await sleep(700);
 
+      const afterTop = scroller.scrollTop;
+      const afterHeight = scroller.scrollHeight;
+
+      const progressed = afterTop !== beforeTop || afterHeight !== beforeHeight;
+
+      if (!progressed) noProgressRounds++;
+      else noProgressRounds = 0;
+
+      if (i % 40 === 0) {
+        console.log(
+          `[load-top] i=${i} scrollTop=${scroller.scrollTop} scrollHeight=${scroller.scrollHeight} noProgress=${noProgressRounds}`
+        );
+      }
+
+      if (scroller.scrollTop === 0 || noProgressRounds >= 30) break;
+    }
+
+    console.log("[export] loaded to top");
+  }
+
+  async function collectAllByScrollingDownOrdered(scroller) {
+    const acc = { seen: new Set(), list: [] };
+
+    let noNewRounds = 0;
+
+    for (let i = 0; i < 4000; i++) {
       const beforeSize = acc.seen.size;
-      addTurns(acc, parseTurnsNow());
+      addTurnsInOrder(acc, parseTurnsInDomOrder());
       const afterSize = acc.seen.size;
 
       const newAdded = afterSize - beforeSize;
-
       if (newAdded === 0) noNewRounds++;
       else noNewRounds = 0;
 
-      if (i % 30 === 0) {
+      const beforeTop = scroller.scrollTop;
+      const step = Math.max(250, Math.floor(scroller.clientHeight * 0.9));
+      scroller.scrollTop = Math.min(scroller.scrollHeight, beforeTop + step);
+
+      await sleep(450);
+
+      const atBottom =
+        scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 2;
+
+      if (i % 50 === 0) {
         console.log(
-          `[collect-up] i=${i} collected=${acc.list.length} newAdded=${newAdded} noNew=${noNewRounds} scrollTop=${scroller.scrollTop}`
+          `[collect-down] i=${i} collected=${acc.list.length} newAdded=${newAdded} noNew=${noNewRounds} scrollTop=${scroller.scrollTop}`
         );
       }
-      if (scroller.scrollTop === 0 || noNewRounds >= 25) break;
+
+      if (atBottom && noNewRounds >= 20) break;
     }
-    return acc.list.slice().reverse();
+
+    return acc.list;
   }
 
   function downloadText(filename, text, mime = "text/plain") {
@@ -93,7 +149,12 @@
   }
 
   function toTxt(turns) {
-    return turns.map((t) => t.text).join("\n\n---\n\n") + "\n";
+    const width = String(turns.length).length;
+    const pad = (n) => String(n).padStart(width, "0");
+
+    return (
+      turns.map((t, i) => `#${pad(i + 1)}\n\n${t.text}`).join("\n\n") + "\n"
+    );
   }
 
   function makeFileBaseName() {
@@ -116,7 +177,15 @@
 
       console.log("[export] start");
 
-      const turns = await collectAllByScrollingUp(scroller);
+      scroller.scrollTop = scroller.scrollHeight;
+      await sleep(300);
+
+      await loadAllToTop(scroller);
+
+      scroller.scrollTop = 0;
+      await sleep(300);
+
+      const turns = await collectAllByScrollingDownOrdered(scroller);
 
       console.log("[export] collected turns:", turns.length);
 
